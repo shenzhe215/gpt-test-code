@@ -1,0 +1,17 @@
+# Node
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# Python
+__pycache__/
+*.pyc
+
+# SQLite
+backend/data/*.db
+backend/data/*.sqlite
+backend/data/*.sqlite3
+
+# Env
+.env
+
