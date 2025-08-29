@@ -30,6 +30,47 @@ export const api = {
 
   getDueCards: () => get('/api/review/today'),
 
-  gradeCard: (id, quality) => post('/api/review/grade', { id, quality })
+  gradeCard: (id, quality) => post('/api/review/grade', { id, quality }),
+
+  // 百度翻译配置相关方法
+  getBaiduConfigStatus: async () => {
+    const response = await fetch('/api/translate/baidu-config', {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    })
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`)
+    }
+    return await response.json()
+  },
+
+  configureBaiduTranslate: async (config) => {
+    const response = await fetch('/api/translate/baidu-config', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(config),
+    })
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`)
+    }
+    return await response.json()
+  },
+
+  clearBaiduConfig: async () => {
+    const response = await fetch('/api/translate/baidu-config', {
+      method: 'DELETE',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    })
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`)
+    }
+    return await response.json()
+  }
 }
 
