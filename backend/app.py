@@ -5,12 +5,17 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime, date, timedelta
 import sqlite3
 import os
-
+import random
+import requests
+import hashlib
 
 DB_DIR = os.path.join(os.path.dirname(__file__), "data")
 DB_PATH = os.path.join(DB_DIR, "app.db")
 os.makedirs(DB_DIR, exist_ok=True)
 
+# 添加全局变量存储API密钥
+_baidu_app_id = None
+_baidu_secret_key = None
 
 def get_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -119,14 +124,118 @@ class GradeRequest(BaseModel):
     quality: int = Field(ge=0, le=5)
 
 
-# Utilities
-def naive_stub_translate(text: str, source: str, target: str) -> str:
-    # This is a placeholder. Replace with a real translation service or model.
+class BaiduConfigRequest(BaseModel):
+    app_id: str = Field(..., description="百度翻译App ID")
+    secret_key: str = Field(..., description="百度翻译Secret Key")
+
+class BaiduConfigResponse(BaseModel):
+    status: str
+    message: str
+
+class BaiduConfigStatus(BaseModel):
+    is_configured: bool
+    app_id_masked: Optional[str] = None
+
+
+def set_baidu_credentials(app_id: str, secret_key: str):
+    """
+    设置百度翻译API凭证
+    """
+    global _baidu_app_id, _baidu_secret_key
+    _baidu_app_id = app_id
+    _baidu_secret_key = secret_key
+    print(f"百度翻译API凭证已设置: App ID = {app_id[:6]}..., Secret Key = {secret_key[:6]}...")
+
+def get_baidu_credentials():
+    """
+    获取百度翻译API凭证
+    """
+    global _baidu_app_id, _baidu_secret_key
+    return _baidu_app_id, _baidu_secret_key
+
+def is_baidu_configured():
+    """
+    检查百度翻译是否已配置
+    """
+    app_id, secret_key = get_baidu_credentials()
+    return app_id is not None and secret_key is not None
+
+def mask_app_id(app_id: str) -> str:
+    """
+    遮蔽App ID显示
+    """
+    if len(app_id) <= 8:
+        return "*" * len(app_id)
+    return app_id[:4] + "*" * (len(app_id) - 8) + app_id[-4:]
+
+def baidu_translate(text: str, source: str, target: str) -> str:
+    """
+    使用百度翻译API进行翻译
+    """
+    # 获取百度翻译API信息
+    BAIDU_APP_ID, BAIDU_SECRET_KEY = get_baidu_credentials()
+    
     if not text.strip():
         return ""
-    return f"[stub {source}->{target}] {text}"
+    
+    # 检查是否已配置API密钥
+    if not is_baidu_configured():
+        print("警告：请先配置百度翻译API密钥")
+        return f"[stub {source}->{target}] {text}"
+      
+    try:
+        # 百度翻译API URL
+        url = "https://fanyi-api.baidu.com/api/trans/vip/translate"
+        
+        # 生成随机数
+        salt = random.randint(32768, 65536)
+        
+        # 生成签名：appid+q+salt+密钥 的MD5值
+        sign_str = BAIDU_APP_ID + text + str(salt) + BAIDU_SECRET_KEY
+        sign = hashlib.md5(sign_str.encode('utf-8')).hexdigest()
+        
+        # 构造请求参数
+        params = {
+            'q': text,
+            'from': source,
+            'to': target,
+            'appid': BAIDU_APP_ID,
+            'salt': salt,
+            'sign': sign
+        }
+        
+        print(f"Requesting translation from {source} to {target}: {text}")
+        response = requests.get(url, params=params, timeout=5)
+        print(f"Baidu Translate API response status: {response.status_code}")
+        
+        if response.status_code == 200:
+            result = response.json()
+            print(f"Raw API response: {result}")
+            
+            # 检查是否有错误码
+            if 'error_code' in result:
+                print(f"Baidu API error code: {result['error_code']}, message: {result.get('error_msg', 'Unknown error')}")
+                return f"[stub {source}->{target}] {text}"
+            
+            # 提取翻译结果
+            if 'trans_result' in result and isinstance(result['trans_result'], list):
+                translated_parts = [item['dst'] for item in result['trans_result'] if 'dst' in item]
+                if translated_parts:
+                    translated_text = "".join(translated_parts).strip()
+                    print(f"Parsed translation: '{translated_text}'")
+                    return translated_text
+        
+        # 如果API调用失败，回退到原来的占位符实现
+        print("Translation API call failed, using fallback")
+        return f"[stub {source}->{target}] {text}"
+    except Exception as e:
+        # 发生异常时回退到占位符实现
+        print(f"Translation exception: {str(e)}")
+        return f"[stub {source}->{target}] {text}"
 
-
+# 更新naive_stub_translate函数以使用百度翻译
+def naive_stub_translate(text: str, source: str, target: str) -> str:
+    return baidu_translate(text, source, target)
 def split_sentences(text: str) -> List[str]:
     import re
     sents = re.split(r"(?<=[.!?])\s+", text.strip())
@@ -225,6 +334,44 @@ def sm2_update(repetitions: int, interval: int, easiness: float, quality: int):
 
 
 # Routes
+# 2025/8/29添加百度翻译配置相关API端点
+@app.post("/api/translate/baidu-config", response_model=BaiduConfigResponse)
+def configure_baidu_translate(config: BaiduConfigRequest):
+    """
+    配置百度翻译API密钥
+    """
+    if not config.app_id or not config.secret_key:
+        raise HTTPException(status_code=400, detail="App ID和Secret Key不能为空")
+    
+    set_baidu_credentials(config.app_id, config.secret_key)
+    return BaiduConfigResponse(
+        status="success",
+        message="百度翻译API密钥配置成功"
+    )
+
+@app.get("/api/translate/baidu-config", response_model=BaiduConfigStatus)
+def get_baidu_config_status():
+    """
+    获取百度翻译配置状态
+    """
+    is_configured = is_baidu_configured()
+    app_id, _ = get_baidu_credentials()
+    
+    return BaiduConfigStatus(
+        is_configured=is_configured,
+        app_id_masked=mask_app_id(app_id) if is_configured and app_id else None
+    )
+
+@app.delete("/api/translate/baidu-config", response_model=BaiduConfigResponse)
+def clear_baidu_config():
+    """
+    清除百度翻译API密钥配置
+    """
+    set_baidu_credentials(None, None)
+    return BaiduConfigResponse(
+        status="success",
+        message="百度翻译API密钥已清除"
+    )
 @app.post("/api/translate", response_model=TranslateResponse)
 def translate(req: TranslateRequest):
     translated = naive_stub_translate(req.text, req.source_lang, req.target_lang)
