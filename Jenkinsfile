@@ -10,6 +10,8 @@ pipeline {
     NAMESPACE = 'jason-docker-aliyun'
     BACKEND_REPO  = "${REGISTRY}/${NAMESPACE}/gpt-test-backend"
     FRONTEND_REPO = "${REGISTRY}/${NAMESPACE}/gpt-test-frontend"
+    // Use workspace-local Docker config so auth persists across stages
+    DOCKER_CONFIG = "${WORKSPACE}/.docker"
   }
 
   stages {
@@ -38,8 +40,11 @@ pipeline {
 
     stage('Docker Login (ACR)') {
       steps {
+        sh label: 'Prepare docker config dir', script: 'mkdir -p "$DOCKER_CONFIG" && rm -f "$DOCKER_CONFIG/config.json" || true'
         withCredentials([usernamePassword(credentialsId: 'ACR_CREDS', usernameVariable: 'ACR_USER', passwordVariable: 'ACR_PASS')]) {
-          sh label: 'Login to ACR', script: 'echo "$ACR_PASS" | docker login --username "$ACR_USER" --password-stdin "$REGISTRY"'
+          sh label: 'Login to ACR', script: 'set -euxo pipefail; echo "$ACR_PASS" | docker --config "$DOCKER_CONFIG" login --username "$ACR_USER" --password-stdin "$REGISTRY"'
+          // Optional: print which registries are present in config (no secrets leaked)
+          sh label: 'Verify docker auth entry', script: 'set -e; test -f "$DOCKER_CONFIG/config.json" && python3 - <<PY\nimport json, os\npath = os.path.join(os.environ.get("DOCKER_CONFIG", ""), "config.json")\nwith open(path, "r", encoding="utf-8") as f:\n    cfg = json.load(f)\nprint("auths:", list(cfg.get("auths", {}).keys()))\nPY'
         }
       }
     }
@@ -61,9 +66,10 @@ pipeline {
 
   post {
     always {
-      sh 'docker logout "$REGISTRY" || true'
+      // Clean up docker auth used for this build only
+      sh 'docker --config "$DOCKER_CONFIG" logout "$REGISTRY" || true'
+      sh 'rm -rf "$DOCKER_CONFIG" || true'
       sh 'docker image prune -f || true'
     }
   }
 }
-
