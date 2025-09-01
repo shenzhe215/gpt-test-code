@@ -71,6 +71,30 @@ npm run preview
 
 或自行将 `dist/` 产物部署到静态托管服务，并在网关/反向代理层把 `/api` 指向后端。
 
+## 使用 Docker 部署
+
+后端镜像（暴露 8000）：
+
+```bash
+docker build -t english-backend -f backend/Dockerfile .
+docker run -d --name backend -p 8000:8000 english-backend
+```
+
+前端镜像（使用 Nginx 监听 3000，避免 8080）：
+
+```bash
+docker build -t english-frontend -f frontend/Dockerfile .
+
+# 若后端容器名为 backend（同网络下可解析），直接运行：
+docker run -d --name frontend -p 3000:3000 --link backend english-frontend
+
+# 或者显式指定后端地址（例如主机 8000 端口）：
+# Linux 新版 Docker 支持 host.docker.internal，也可替换为内网 IP
+docker run -d --name frontend -p 3000:3000 -e BACKEND_URL=http://host.docker.internal:8000 english-frontend
+```
+
+现在访问前端：`http://127.0.0.1:3000`。
+
 ## API 概述（节选）
 
 - `POST /api/translate` { text, source_lang, target_lang } -> { translated_text }
