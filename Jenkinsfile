@@ -65,6 +65,31 @@ pipeline {
   }
 
   post {
+    failure {
+      script {
+        def subject = "Jenkins FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}"
+        def body = """
+Build failed.
+
+Job: ${env.JOB_NAME}
+Build: #${env.BUILD_NUMBER}
+Branch: ${env.BRANCH_NAME ?: 'N/A'}
+Image Tag: ${env.IMAGE_TAG ?: 'N/A'}
+URL: ${env.BUILD_URL}
+
+Please check console output for details.
+"""
+        try {
+          emailext(to: 'szwhut@outlook.com', subject: subject, body: body)
+        } catch (e) {
+          try {
+            mail to: 'szwhut@outlook.com', subject: subject, body: body
+          } catch (e2) {
+            echo "Email notification failed: ${e2}"
+          }
+        }
+      }
+    }
     always {
       // Clean up docker auth used for this build only
       sh 'docker --config "$DOCKER_CONFIG" logout "$REGISTRY" || true'
@@ -73,3 +98,5 @@ pipeline {
     }
   }
 }
+
+
