@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
@@ -8,6 +8,11 @@ import os
 import random
 import requests
 import hashlib
+from passlib.context import CryptContext
+from jose import JWTError, jwt
+from datetime import datetime, timedelta
+import secrets
+from fastapi.security import OAuth2PasswordBearer
 
 DB_DIR = os.path.join(os.path.dirname(__file__), "data")
 DB_PATH = os.path.join(DB_DIR, "app.db")
@@ -16,6 +21,18 @@ os.makedirs(DB_DIR, exist_ok=True)
 # 添加全局变量存储API密钥
 _baidu_app_id = None
 _baidu_secret_key = None
+
+# 密码哈希配置
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# JWT配置
+SECRET_KEY = secrets.token_urlsafe(32)
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+# OAuth2配置
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/auth/login")
+
 
 def get_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -48,6 +65,19 @@ def init_db():
             interval INTEGER NOT NULL DEFAULT 0,
             easiness REAL NOT NULL DEFAULT 2.5,
             next_review TEXT NOT NULL
+        )
+        """
+    )
+    # Users table
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            baidu_app_id TEXT,
+            baidu_secret_key TEXT,
+            created_at TEXT NOT NULL
         )
         """
     )
@@ -135,6 +165,31 @@ class BaiduConfigResponse(BaseModel):
 class BaiduConfigStatus(BaseModel):
     is_configured: bool
     app_id_masked: Optional[str] = None
+
+class UserRegistrationRequest(BaseModel):
+    username: str = Field(..., description="用户名", min_length=3, max_length=50)
+    password: str = Field(..., description="密码", min_length=6)
+    baidu_app_id: str = Field(..., description="百度翻译App ID")
+    baidu_secret_key: str = Field(..., description="百度翻译Secret Key")
+
+class UserLoginRequest(BaseModel):
+    username: str = Field(..., description="用户名", min_length=3, max_length=50)
+    password: str = Field(..., description="密码", min_length=6)
+
+class UserResponse(BaseModel):
+    id: int
+    username: str
+    baidu_app_id_masked: Optional[str] = None
+    created_at: str
+
+class AuthResponse(BaseModel):
+    access_token: str
+    token_type: str
+    user: UserResponse
+
+class UserConfigResponse(BaseModel):
+    baidu_app_id_masked: Optional[str] = None
+    has_baidu_config: bool
 
 
 def set_baidu_credentials(app_id: str, secret_key: str):
@@ -332,8 +387,147 @@ def sm2_update(repetitions: int, interval: int, easiness: float, quality: int):
     next_review = date.today() + timedelta(days=max(1, interval))
     return repetitions, interval, easiness, next_review.isoformat()
 
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def get_user_by_username(username: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE username = ?", (username,))
+    user = cur.fetchone()
+    conn.close()
+    return user
+
+def get_current_user(token: str):
+    credentials_exception = HTTPException(
+        status_code=401,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    user = get_user_by_username(username)
+    if user is None:
+        raise credentials_exception
+    return user
+
+# 添加依赖函数
+async def get_current_user_dependency(token: str = Depends(oauth2_scheme)):
+    return get_current_user(token)
+
 
 # Routes
+# 2025/8/30 添加认证相关路由
+@app.post("/api/auth/register", response_model=AuthResponse)
+def register_user(user: UserRegistrationRequest):  # 修复：使用正确的类名
+    # 检查用户名是否已存在
+    if get_user_by_username(user.username):
+        raise HTTPException(status_code=400, detail="Username already registered")
+    
+    # 创建用户
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        password_hash = get_password_hash(user.password)
+        created_at = datetime.utcnow().isoformat()
+        
+        cur.execute(
+            """
+            INSERT INTO users (username, password_hash, baidu_app_id, baidu_secret_key, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (user.username, password_hash, user.baidu_app_id, user.baidu_secret_key, created_at)
+        )
+        conn.commit()
+        user_id = cur.lastrowid
+        
+        # 设置百度翻译配置
+        set_baidu_credentials(user.baidu_app_id, user.baidu_secret_key)
+        
+        # 创建访问令牌
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={"sub": user.username}, expires_delta=access_token_expires
+        )
+        
+        return AuthResponse(
+            access_token=access_token,
+            token_type="bearer",
+            user=UserResponse(
+                id=user_id,
+                username=user.username,
+                baidu_app_id_masked=mask_app_id(user.baidu_app_id),
+                created_at=created_at
+            )
+        )
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+@app.post("/api/auth/login", response_model=AuthResponse)
+def login_user(user: UserLoginRequest):
+    db_user = get_user_by_username(user.username)
+    if not db_user or not verify_password(user.password, db_user['password_hash']):
+        raise HTTPException(status_code=400, detail="Incorrect username or password")
+    
+    # 设置百度翻译配置
+    if db_user['baidu_app_id'] and db_user['baidu_secret_key']:
+        set_baidu_credentials(db_user['baidu_app_id'], db_user['baidu_secret_key'])
+    
+    # 创建访问令牌
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.username}, expires_delta=access_token_expires
+    )
+    
+    return AuthResponse(
+        access_token=access_token,
+        token_type="bearer",
+        user=UserResponse(
+            id=db_user['id'],
+            username=db_user['username'],
+            baidu_app_id_masked=mask_app_id(db_user['baidu_app_id']) if db_user['baidu_app_id'] else None,
+            created_at=db_user['created_at']
+        )
+    )
+
+@app.get("/api/auth/me", response_model=UserResponse)
+def read_users_me(current_user: dict = Depends(get_current_user_dependency)):
+    return UserResponse(
+        id=current_user['id'],
+        username=current_user['username'],
+        baidu_app_id_masked=mask_app_id(current_user['baidu_app_id']) if current_user['baidu_app_id'] else None,
+        created_at=current_user['created_at']
+    )
+
+@app.get("/api/auth/config", response_model=UserConfigResponse)
+def get_user_config(current_user: dict = Depends(get_current_user_dependency)):
+    has_config = bool(current_user['baidu_app_id'] and current_user['baidu_secret_key'])
+    return UserConfigResponse(
+        baidu_app_id_masked=mask_app_id(current_user['baidu_app_id']) if current_user['baidu_app_id'] else None,
+        has_baidu_config=has_config
+    )
 # 2025/8/29添加百度翻译配置相关API端点
 @app.post("/api/translate/baidu-config", response_model=BaiduConfigResponse)
 def configure_baidu_translate(config: BaiduConfigRequest):
@@ -373,7 +567,7 @@ def clear_baidu_config():
         message="百度翻译API密钥已清除"
     )
 @app.post("/api/translate", response_model=TranslateResponse)
-def translate(req: TranslateRequest):
+def translate(req: TranslateRequest, current_user: dict = Depends(get_current_user_dependency)):
     translated = naive_stub_translate(req.text, req.source_lang, req.target_lang)
     # Log practice
     conn = get_conn()
@@ -524,4 +718,3 @@ def grade_card(req: GradeRequest):
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
-
